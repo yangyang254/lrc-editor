@@ -1011,6 +1011,7 @@ class LrcEditor(tk.Tk):
         self.bind("<Alt-Right>", lambda e: None if self._typing() else self.nudge_selected(100))
         self.bind("<Alt-Shift-Left>", lambda e: None if self._typing() else self.nudge_selected(-10))
         self.bind("<Alt-Shift-Right>", lambda e: None if self._typing() else self.nudge_selected(10))
+        self.bind("<Control-a>", self._on_select_all)
         self.bind("<Control-c>", self._on_copy)
         self.bind("<Control-x>", self._on_cut)
         self.bind("<Control-v>", self._on_paste)
@@ -1102,6 +1103,15 @@ class LrcEditor(tk.Tk):
         if i2 < len(children):
             self.tree.see(children[i2])
 
+    def _on_select_all(self, event=None):
+        if self._typing():
+            return  # 输入框内不接管
+        kids = self.tree.get_children()
+        if kids:
+            self.tree.selection_set(kids)
+            self.tree.see(kids[0])
+        return "break"
+
     def _on_copy(self, event=None):
         if self._typing():
             return
@@ -1129,7 +1139,8 @@ class LrcEditor(tk.Tk):
         # 时间戳留空：粘贴后等待手动打轴（系统剪贴板文本仍带原时间戳）
         self.clip_lines = [LrcLine([], l.text) for l in targets]
         try:
-            text = "\n".join(build_lrc({}, self.clip_lines, keep_no_time=True).strip().splitlines())
+            text = "\n".join(build_lrc({}, self.clip_lines, keep_no_time=True,
+                                        sort=False).strip().splitlines())
             self.clipboard_clear()
             self.clipboard_append(text)
         except tk.TclError:
@@ -1453,7 +1464,7 @@ class LrcEditor(tk.Tk):
         if not self.file_path:
             return self.save_as()
         text = build_lrc(self.meta, self.lines, digits=int(self.digits.get()),
-                         sort=True, keep_no_time=self.keep_no_time.get())
+                         sort=False, keep_no_time=self.keep_no_time.get())
         try:
             with open(self.file_path, "w", encoding=self.encoding.get(), newline="\n") as f:
                 f.write(text)
@@ -1461,13 +1472,20 @@ class LrcEditor(tk.Tk):
             messagebox.showerror("错误", f"保存失败：\n{ex}\n\n可尝试更换编码（如 gbk → utf-8）")
             return False
         self._set_modified(False)
-        no_time = sum(1 for l in self.lines if not l.times)
+        issues = []
+        timed = [l for l in self.lines if l.times]
+        no_time = len(self.lines) - len(timed)
         if no_time and not self.keep_no_time.get():
-            messagebox.showwarning(
-                "已保存（有未打轴的句子）",
-                f"保存成功，但有 {no_time} 句还没有时间戳，未包含在文件中。\n"
-                f"继续手动打轴后重新保存即可；\n"
-                f"如需把它们原样保留在文件里，请勾选底部『保留无时间戳行』。")
+            issues.append(f"· 有 {no_time} 句没有时间戳，未包含在文件中"
+                          "（勾选『保留无时间戳行』可原样保留）")
+        out_order = sum(1 for a, b in zip(timed, timed[1:])
+                        if b.first_time < a.first_time)
+        if out_order:
+            issues.append(f"· 有 {out_order} 处时间戳乱序，已按当前顺序原样保存"
+                          "（可用『⇅ 排序』整理后重新保存）")
+        if issues:
+            messagebox.showwarning("已保存（有提示）",
+                                   "保存成功，但存在以下情况：\n" + "\n".join(issues))
         self.status.set(f"已保存到 {self.file_path}（编码 {self.encoding.get()}）")
         return True
 
@@ -1519,21 +1537,13 @@ class LrcEditor(tk.Tk):
             self.empty_state.place(relx=0.5, rely=0.42, anchor="center")
 
     def _display_order(self):
-        """显示顺序：有时间戳按时间排；无时间戳行保持插入位置（跟在上一个有时间戳的行后）"""
-        keyed = []
-        cur = -1.0
-        for idx, ln in enumerate(self.lines):
-            if ln.times:
-                cur = ln.first_time
-                keyed.append((cur, 0, idx, ln))
-            else:
-                keyed.append((cur, 1 + idx, idx, ln))
-        keyed.sort(key=lambda t: (t[0], t[1], t[2]))
-        return [t[3] for t in keyed]
+        """显示顺序 = 当前列表顺序。
+        不按时间戳自动重排：调整时间戳（打轴/微调）时行保持原位，
+        乱序在保存时检查并警告；需要排序用『⇅ 排序』手动执行"""
+        return list(self.lines)
 
     def _sorted_index(self):
-        pos = {id(l): i for i, l in enumerate(self.lines)}
-        return [pos[id(l)] for l in self._display_order()]
+        return list(range(len(self.lines)))
 
     def _selected_lines(self):
         sel = set(self.tree.selection())
@@ -2153,22 +2163,17 @@ class LrcEditor(tk.Tk):
                 self.btn_play.config(text="⏸ 暂停" if a.playing else "▶ 播放")
                 if a.playing:
                     self.time_lbl.config(foreground="")
-                    if self.stamp_mode.get().startswith("跟随时间戳"):  # 手动两种模式不按旧时间戳换行
-                        item = self._find_singing_item(pos)
-                        self._mark_singing(item)
-                        self.tree.tag_configure(
-                            "singing", foreground=lerp_color(PAL["accent"], PAL["accent_hi"],
-                                                             self._pulse(1.4)))
-                        cur = self._lyric_at(pos)
-                        self.now_singing.set("♪ " + cur if cur else "♪ （前奏）")
-                        # 手动滚动/点击歌词后 2 秒内不自动跟随，方便人工浏览
-                        if item and self.follow.get() and time.monotonic() - self._manual_scroll > 2.0:
-                            self.tree.see(item)
-                    else:
-                        # 手动打轴模式：换行由回车控制，不按（待修正的）旧时间戳自动换行
-                        self._mark_singing(None)
-                        self.now_singing.set(
-                            "✎ 手动打轴模式 — 回车打轴选中行并跳下一行，不按旧时间戳换行")
+                    # 两种打轴模式都显示当前播放的歌词（打轴目标仍由模式决定）
+                    item = self._find_singing_item(pos)
+                    self._mark_singing(item)
+                    self.tree.tag_configure(
+                        "singing", foreground=lerp_color(PAL["accent"], PAL["accent_hi"],
+                                                         self._pulse(1.4)))
+                    cur = self._lyric_at(pos)
+                    self.now_singing.set("♪ " + cur if cur else "♪ （前奏）")
+                    # 手动滚动/点击歌词后 2 秒内不自动跟随，方便人工浏览
+                    if item and self.follow.get() and time.monotonic() - self._manual_scroll > 2.0:
+                        self.tree.see(item)
                 elif a._paused:
                     # 暂停：红色脉冲醒目显示当前时间点
                     self.time_lbl.config(foreground=lerp_color(PAL["paused_a"],
