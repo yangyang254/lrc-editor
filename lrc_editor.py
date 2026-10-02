@@ -440,7 +440,6 @@ class LrcEditor(tk.Tk):
         self._slider_dragging = False
         self._undo_stack = []    # 快照栈（撤销/重做）
         self._redo_stack = []
-        self._manual_scroll = 0.0  # 最近一次手动滚动歌词列表的时间
         self._aim_item = None      # 回车打轴目标的行（下一句模式的可视化标记）
         # 批量选择统一用树控件的多选：行首 ☑ 只是选中状态的可视化
         self._drag_sel = None      # 按住拖动批量选择状态
@@ -858,9 +857,6 @@ class LrcEditor(tk.Tk):
                                     foreground=PAL["accent"])
         self.wv_singing.pack(
             side="left", fill="x", expand=True, padx=(px(6), px(0)))
-        self.follow = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row3, text="跟随当前句", variable=self.follow).pack(
-            side="left", padx=(px(10), px(0)))
         # 打轴校准：补偿固定偏差（人耳反应/系统输出延迟），正=延后，负=提前
         ttk.Label(row3, text="打轴校准(ms)").pack(side="left", padx=(px(8), px(2)))
         self.calib = tk.IntVar(value=0)
@@ -934,10 +930,10 @@ class LrcEditor(tk.Tk):
         self.tree.bind("<ButtonPress-1>", self._col_drag_press, add="+")
         self.tree.bind("<B1-Motion>", self._col_drag_motion, add="+")
         self.tree.bind("<ButtonRelease-1>", self._col_drag_release, add="+")
-        # 手动滚动歌词时暂停自动跟随
-        self.tree.bind("<MouseWheel>", self._note_manual_scroll)
-        vs.bind("<ButtonPress-1>", self._note_manual_scroll)
-        vs.bind("<B1-Motion>", self._note_manual_scroll)
+        # 滚动歌词时确认行内编辑
+        self.tree.bind("<MouseWheel>", self._commit_pending_edit)
+        vs.bind("<ButtonPress-1>", self._commit_pending_edit)
+        vs.bind("<B1-Motion>", self._commit_pending_edit)
         self.tree.tag_configure("odd", background=PAL["zebra"])
         self.tree.tag_configure("warn", background=PAL["warn"])
         self.tree.tag_configure("bad", background=PAL["bad"])
@@ -1803,7 +1799,7 @@ class LrcEditor(tk.Tk):
     def _on_tree_click(self, event):
         if self._editor:                 # 点别处 = 确认正在编辑的内容
             self._commit_cell_edit()
-        self._note_manual_scroll()
+        self._commit_pending_edit()
         col = self.tree.identify_column(event.x)
         item = self.tree.identify_row(event.y)
         region = self.tree.identify_region(event.x, event.y)
@@ -1864,10 +1860,9 @@ class LrcEditor(tk.Tk):
                              command=lambda n=n, it=item: self.add_rows(n, after_item=it))
         menu.tk_popup(x, y)
 
-    def _note_manual_scroll(self, _event=None):
+    def _commit_pending_edit(self, _event=None):
         if self._editor:                 # 滚动/点击其他位置 = 确认编辑
             self._commit_cell_edit()
-        self._manual_scroll = time.monotonic()
 
     def _jump_row(self, item):
         if not self.audio.loaded:
@@ -2171,9 +2166,6 @@ class LrcEditor(tk.Tk):
                                                          self._pulse(1.4)))
                     cur = self._lyric_at(pos)
                     self.now_singing.set("♪ " + cur if cur else "♪ （前奏）")
-                    # 手动滚动/点击歌词后 2 秒内不自动跟随，方便人工浏览
-                    if item and self.follow.get() and time.monotonic() - self._manual_scroll > 2.0:
-                        self.tree.see(item)
                 elif a._paused:
                     # 暂停：红色脉冲醒目显示当前时间点
                     self.time_lbl.config(foreground=lerp_color(PAL["paused_a"],
