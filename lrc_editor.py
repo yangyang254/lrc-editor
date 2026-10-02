@@ -1057,14 +1057,26 @@ class LrcEditor(tk.Tk):
             self._move_column(col, target)
 
     def _move_column(self, col, target):
-        """把 col 列移到 target 列之前/之后（按拖动方向）"""
-        disp = list(self.tree["displaycolumns"]) or list(self.tree["columns"])
-        if col not in disp or target not in disp or col == target:
+        """把显示位置 col 的列移到显示位置 target 之前/之后（按拖动方向）。
+        col/target 是 identify_column 给出的位置编号（#1、#2…），需换算成列 ID"""
+        raw = self.tree["displaycolumns"]
+        if isinstance(raw, str):
+            disp = raw.split()          # Tk 返回的是空格分隔字符串，不能直接 list()
+        else:
+            disp = list(raw)
+        if not disp:
+            disp = list(self.tree["columns"])
+        try:
+            ci, ti = int(col[1:]) - 1, int(target[1:]) - 1  # "#1" = 显示位置 0
+        except ValueError:
             return
-        orig_i = disp.index(col)
-        disp.remove(col)
-        tgt_i = disp.index(target)
-        disp.insert(tgt_i + 1 if orig_i < tgt_i else tgt_i, col)
+        if not (0 <= ci < len(disp)) or not (0 <= ti < len(disp)) or ci == ti:
+            return
+        col_id = disp[ci]
+        disp.pop(ci)
+        # 往右拖 = 落到目标列后面；往左拖 = 落到目标列前面
+        disp.insert(disp.index(disp[ti if ci > ti else ti - 1]) + (0 if ci > ti else 1),
+                    col_id)
         self.tree["displaycolumns"] = disp
 
     def _drag_motion(self, event):
@@ -1778,9 +1790,12 @@ class LrcEditor(tk.Tk):
             self.status.set(f"已跳转到 {fmt_clock(ms)}")
 
     def _on_tree_click(self, event):
+        if self._editor:                 # 点别处 = 确认正在编辑的内容
+            self._commit_cell_edit()
         self._note_manual_scroll()
         col = self.tree.identify_column(event.x)
         item = self.tree.identify_row(event.y)
+        region = self.tree.identify_region(event.x, event.y)
         if col == "#1" and item:                # 复选框：勾选/取消（批量操作用）
             self._toggle_check(item)
             return "break"
@@ -1792,11 +1807,20 @@ class LrcEditor(tk.Tk):
             return "break"
         if col == "#7" and item:                # 行尾 ▶ 从该句播放
             self._jump_row(item)
-        if (col in ("#4", "#5", "#3", "#6") and item
-                and not (event.state & 0x0004) and not (event.state & 0x0001)):
-            # 按住句子直接上下拖动 = 连续多选（松手完成）
+            return "break"
+        if region in ("heading", "separator"):
+            return                              # 列头交给拖动排序处理
+        if not (event.state & 0x0004) and not (event.state & 0x0001):
+            # 按住任意行/空白处上下拖动 = 连续多选（松手完成）
+            kids = self.tree.get_children()
+            if not kids:
+                return "break"
+            if not item:                        # 按在空白处：就近取锚点行
+                last_bbox = self.tree.bbox(kids[-1])
+                item = kids[-1] if (not last_bbox or event.y > last_bbox[1]) else kids[0]
             self._drag_sel = {"item": item}
             self.tree.selection_set(item)
+            self.tree.focus(item)
             return "break"
 
     def _on_tree_motion(self, event):
@@ -1830,6 +1854,8 @@ class LrcEditor(tk.Tk):
         menu.tk_popup(x, y)
 
     def _note_manual_scroll(self, _event=None):
+        if self._editor:                 # 滚动/点击其他位置 = 确认编辑
+            self._commit_cell_edit()
         self._manual_scroll = time.monotonic()
 
     def _jump_row(self, item):
@@ -1871,6 +1897,8 @@ class LrcEditor(tk.Tk):
             f"（Ctrl+Z 可撤销）")
 
     def _show_ctx(self, event):
+        if self._editor:
+            self._commit_cell_edit()
         item = self.tree.identify_row(event.y)
         if not item:
             return
