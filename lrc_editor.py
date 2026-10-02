@@ -446,6 +446,8 @@ class LrcEditor(tk.Tk):
         self._editor = None        # 行内编辑器 (entry, item, col, ln)
         self._hover_cell = None    # 悬停的 + 单元格
         self._hover_job = None
+        self.clip_lines = []       # 内部歌词剪贴板（结构化行）
+        self._hold_select = None   # 长按拖动批量选择状态
 
         self._setup_style()
         self._build_menu()
@@ -703,6 +705,10 @@ class LrcEditor(tk.Tk):
                            command=lambda: self._begin_cell_edit_sel("text"))
         m_edit.add_command(label="删除选中行", accelerator="Del", command=self.delete_lines)
         m_edit.add_separator()
+        m_edit.add_command(label="复制选中行（Ctrl+C）", command=self._on_copy)
+        m_edit.add_command(label="剪切选中行（Ctrl+X）", command=self._on_cut)
+        m_edit.add_command(label="粘贴到选中行下方（Ctrl+V）", command=self._on_paste)
+        m_edit.add_separator()
         m_edit.add_command(label="查找替换…", accelerator="Ctrl+H", command=self.find_replace)
         mb.add_cascade(label="编辑", menu=m_edit)
 
@@ -918,6 +924,8 @@ class LrcEditor(tk.Tk):
         self.tree.bind("<Motion>", self._on_tree_motion)
         self.tree.bind("<Leave>", lambda e: setattr(self, "_hover_cell", None))
         self.tree.bind("<F2>", lambda e: self._begin_cell_edit_sel("text"))
+        self.tree.bind("<Motion>", self._hold_motion, add="+")
+        self.tree.bind("<ButtonRelease-1>", self._tree_release, add="+")
         # 列头按住拖动可调换列顺序
         self.tree.bind("<ButtonPress-1>", self._col_drag_press, add="+")
         self.tree.bind("<B1-Motion>", self._col_drag_motion, add="+")
@@ -999,6 +1007,9 @@ class LrcEditor(tk.Tk):
         self.bind("<Alt-Right>", lambda e: None if self._typing() else self.nudge_selected(100))
         self.bind("<Alt-Shift-Left>", lambda e: None if self._typing() else self.nudge_selected(-10))
         self.bind("<Alt-Shift-Right>", lambda e: None if self._typing() else self.nudge_selected(10))
+        self.bind("<Control-c>", self._on_copy)
+        self.bind("<Control-x>", self._on_cut)
+        self.bind("<Control-v>", self._on_paste)
         self.bind("<F9>", lambda e: self.smart_fix())
         self.bind("<Delete>", lambda e: self.delete_lines())
         self.bind("<Control-z>", self.undo)
@@ -1052,6 +1063,124 @@ class LrcEditor(tk.Tk):
         tgt_i = disp.index(target)
         disp.insert(tgt_i + 1 if orig_i < tgt_i else tgt_i, col)
         self.tree["displaycolumns"] = disp
+
+    def _start_hold_select(self, item):
+        hs = getattr(self, "_hold_select", None)
+        if not hs or hs.get("item") != item:
+            return
+        hs["active"] = True
+        self._select_range(item, item)
+
+    def _hold_motion(self, event):
+        hs = self._hold_select
+        if hs and hs.get("active"):
+            item = self.tree.identify_row(event.y)
+            if item:
+                self._select_range(hs["item"], item)
+
+    def _tree_release(self, event):
+        hs = getattr(self, "_hold_select", None)
+        if hs:
+            if hs.get("after"):
+                try:
+                    self.after_cancel(hs["after"])
+                except Exception:
+                    pass
+            self._hold_select = None
+
+    def _select_range(self, a, b):
+        children = self.tree.get_children()
+        try:
+            i1, i2 = children.index(a), children.index(b)
+        except ValueError:
+            return
+        if i1 > i2:
+            i1, i2 = i2, i1
+        self.tree.selection_set(children[i1:i2 + 1])
+        if i2 < len(children):
+            self.tree.see(children[i2])
+
+    def _on_copy(self, event=None):
+        if self._typing():
+            return
+        self.copy_lines(False)
+        return "break"
+
+    def _on_cut(self, event=None):
+        if self._typing():
+            return
+        self.copy_lines(True)
+        return "break"
+
+    def _on_paste(self, event=None):
+        if self._typing():
+            return
+        self.paste_lines()
+        return "break"
+
+    def copy_lines(self, cut=False):
+        """复制/剪切选中行：内部剪贴板保留结构，系统剪贴板放 LRC 文本"""
+        targets = self._selected_lines()
+        if not targets:
+            self.status.set("请先选中要复制/剪切的行")
+            return
+        # 时间戳留空：粘贴后等待手动打轴（系统剪贴板文本仍带原时间戳）
+        self.clip_lines = [LrcLine([], l.text) for l in targets]
+        try:
+            text = "\n".join(build_lrc({}, self.clip_lines, keep_no_time=True).strip().splitlines())
+            self.clipboard_clear()
+            self.clipboard_append(text)
+        except tk.TclError:
+            pass
+        if cut:
+            self._push_undo()
+            for l in targets:
+                self.lines.remove(l)
+            self.checked = {l for l in self.checked if l not in targets}
+            self._set_modified()
+            self.refresh()
+            self.status.set(f"✂ 已剪切 {len(targets)} 行 — Ctrl+V 粘贴（时间戳留空待打轴）")
+        else:
+            self.status.set(f"⧉ 已复制 {len(targets)} 行 — Ctrl+V 粘贴到选中行下方")
+
+    def _parse_clip_line(self, line):
+        """解析外部剪贴板的一行（可带 [mm:ss.xx] 时间戳）"""
+        times = [time_to_ms(*m.groups()) for m in TIME_RE.finditer(line)]
+        text = TIME_RE.sub("", line).strip()
+        return LrcLine(times, text)
+
+    def paste_lines(self):
+        """粘贴到选中行下方；本软件复制的行时间戳留空，等待手动打轴"""
+        self._close_editor()
+        if not self.clip_lines:
+            try:
+                text = self.clipboard_get()
+            except tk.TclError:
+                text = ""
+            parsed = [self._parse_clip_line(l) for l in text.splitlines() if l.strip()]
+            if parsed:
+                self.clip_lines = parsed
+        if not self.clip_lines:
+            self.status.set("剪贴板为空 — 先 Ctrl+C / Ctrl+X 复制或剪切歌词行")
+            return
+        self._push_undo()
+        sel = self.tree.selection()
+        anchor = (self.lines[self._sorted_index()[self.tree.index(sel[-1])]]
+                  if sel else None)
+        idx = self.lines.index(anchor) + 1 if anchor in self.lines else len(self.lines)
+        new = [LrcLine(list(l.times), l.text) for l in self.clip_lines]
+        self.lines[idx:idx] = new
+        self._set_modified()
+        self.refresh()
+        disp = self._display_order()
+        if new[0] in disp:
+            row = disp.index(new[0])
+            children = self.tree.get_children()
+            if row < len(children):
+                self.tree.selection_set(children[row])
+                self.tree.see(children[row])
+        self.status.set(
+            f"⇩ 已粘贴 {len(new)} 行到选中行下方（时间戳留空，等待手动打轴；Ctrl+Z 可撤销）")
 
     def _typing(self):
         w = self.focus_get()
@@ -1316,6 +1445,13 @@ class LrcEditor(tk.Tk):
             messagebox.showerror("错误", f"保存失败：\n{ex}\n\n可尝试更换编码（如 gbk → utf-8）")
             return False
         self._set_modified(False)
+        no_time = sum(1 for l in self.lines if not l.times)
+        if no_time and not self.keep_no_time.get():
+            messagebox.showwarning(
+                "已保存（有未打轴的句子）",
+                f"保存成功，但有 {no_time} 句还没有时间戳，未包含在文件中。\n"
+                f"继续手动打轴后重新保存即可；\n"
+                f"如需把它们原样保留在文件里，请勾选底部『保留无时间戳行』。")
         self.status.set(f"已保存到 {self.file_path}（编码 {self.encoding.get()}）")
         return True
 
@@ -1346,7 +1482,7 @@ class LrcEditor(tk.Tk):
             if not ln.text.strip():
                 tags.append("warn")
             item = self.tree.insert("", "end",
-                                    values=("☑" if ln in self.checked else "☐", "+",
+                                    values=("☑" if ln in self.checked else "☐", "+", "−",
                                             i, stamp, ln.text, "▶" if ln.times else ""),
                                     tags=tuple(tags))
             self._row_tags[item] = tuple(tags)
@@ -1377,7 +1513,8 @@ class LrcEditor(tk.Tk):
     def _selected_lines(self):
         sel = set(self.tree.selection())
         children = self.tree.get_children()
-        return [self.lines[self._sorted_index()[children.index(item)]] for item in sel]
+        return [self.lines[self._sorted_index()[children.index(item)]]
+                for item in children if item in sel]  # 按显示顺序返回
 
     # ---------- 行编辑 ----------
 
@@ -1646,6 +1783,12 @@ class LrcEditor(tk.Tk):
             return "break"
         if col == "#7" and item:                # 行尾 ▶ 从该句播放
             self._jump_row(item)
+        if (col in ("#4", "#5") and item
+                and not (event.state & 0x0004) and not (event.state & 0x0001)):
+            # 按住句子 0.5 秒后进入拖动批量选择（上下拖快速多选）
+            self._hold_select = {"item": item, "active": False,
+                                 "after": self.after(
+                                     500, lambda: self._start_hold_select(item))}
 
     def _on_tree_motion(self, event):
         col = self.tree.identify_column(event.x)
