@@ -677,7 +677,6 @@ class LrcEditor(tk.Tk):
         self.tree.tag_configure("warn", background=PAL["warn"])
         self.tree.tag_configure("bad", background=PAL["bad"])
         self.tree.tag_configure("singing", foreground=PAL["accent"])
-        self.tree.tag_configure("aim", foreground=PAL["link"])
         for m in self._menus:
             self._apply_menu_theme(m)
 
@@ -831,8 +830,9 @@ class LrcEditor(tk.Tk):
         self.wv_seek_preview.pack(side="left", padx=(px(4), px(0)))
         ttk.Label(row2, text="回车目标").pack(side="left", padx=(px(10), px(2)))
         self.stamp_mode = tk.StringVar(value="手动打轴（选中行）")
-        cb_mode = ttk.Combobox(row2, textvariable=self.stamp_mode, width=17, state="readonly",
-                               values=["手动打轴（选中行）", "跟随时间戳（下一句）"])
+        cb_mode = ttk.Combobox(row2, textvariable=self.stamp_mode, width=24, state="readonly",
+                               values=["手动打轴（选中行）", "跟随时间戳（当前句）",
+                                       "跟随时间戳（下一句）", "手动打轴且自动平移后面句"])
         cb_mode.pack(side="left")
         cb_mode.bind("<<ComboboxSelected>>", lambda e: self._tick())
         self.btn_stamp = ttk.Button(row2, text="◎ 打轴 (回车)", style="Accent.TButton",
@@ -882,20 +882,23 @@ class LrcEditor(tk.Tk):
 
         mid = ttk.LabelFrame(midwrap, text="歌词行（双击编辑 ｜ Ctrl/Shift 多选批量操作 ｜ 右键菜单：从某句开始播放）")
         mid.pack(side="left", fill="both", expand=True)
-        cols = ("chk", "add", "no", "time", "text", "play")
+        cols = ("chk", "add", "del", "no", "time", "text", "play")
         self.tree = ttk.Treeview(mid, columns=cols, show="headings", selectmode="extended")
         self.tree.heading("chk", text="☑")
         self.tree.heading("add", text="+")
+        self.tree.heading("del", text="−")
         self.tree.heading("no", text="#")
         self.tree.heading("time", text="时间戳")
         self.tree.heading("text", text="歌词文本")
         self.tree.heading("play", text="▶")
-        self.tree.column("chk", width=px(34), anchor="center", stretch=False)
-        self.tree.column("add", width=px(34), anchor="center", stretch=False)
-        self.tree.column("no", width=px(44), anchor="center", stretch=False)
-        self.tree.column("time", width=px(185), anchor="center", stretch=False)
-        self.tree.column("text", width=px(560))
-        self.tree.column("play", width=px(40), anchor="center", stretch=False)
+        self.tree.column("chk", width=px(32), anchor="center", stretch=False)
+        self.tree.column("add", width=px(32), anchor="center", stretch=False)
+        self.tree.column("del", width=px(32), anchor="center", stretch=False)
+        self.tree.column("no", width=px(40), anchor="center", stretch=False)
+        self.tree.column("time", width=px(180), anchor="center", stretch=False)
+        self.tree.column("text", width=px(520))
+        self.tree.column("play", width=px(38), anchor="center", stretch=False)
+        self.tree["displaycolumns"] = list(cols)  # 列头可按住拖动调换顺序
         vs = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
         self.vsb = vs
         self.tree.configure(yscrollcommand=vs.set)
@@ -915,6 +918,10 @@ class LrcEditor(tk.Tk):
         self.tree.bind("<Motion>", self._on_tree_motion)
         self.tree.bind("<Leave>", lambda e: setattr(self, "_hover_cell", None))
         self.tree.bind("<F2>", lambda e: self._begin_cell_edit_sel("text"))
+        # 列头按住拖动可调换列顺序
+        self.tree.bind("<ButtonPress-1>", self._col_drag_press, add="+")
+        self.tree.bind("<B1-Motion>", self._col_drag_motion, add="+")
+        self.tree.bind("<ButtonRelease-1>", self._col_drag_release, add="+")
         # 手动滚动歌词时暂停自动跟随
         self.tree.bind("<MouseWheel>", self._note_manual_scroll)
         vs.bind("<ButtonPress-1>", self._note_manual_scroll)
@@ -924,9 +931,6 @@ class LrcEditor(tk.Tk):
         self.tree.tag_configure("bad", background=PAL["bad"])
         self.tree.tag_configure("singing", foreground=PAL["accent"],
                                 font=(self.font_base[0], 10, "bold"))
-        self.tree.tag_configure("aim", foreground=PAL["link"],
-                                font=(self.font_base[0], 10, "bold"))
-
         # 右键菜单
         self.ctx = tk.Menu(self, tearoff=0)
         self.tree.bind("<Button-3>", self._show_ctx)
@@ -1017,6 +1021,37 @@ class LrcEditor(tk.Tk):
                                      if widget.winfo_exists() else None))
         except Exception:
             pass
+
+    def _col_drag_press(self, event):
+        self._drag_col = None
+        if self.tree.identify_region(event.x, event.y) == "heading":
+            self._drag_col = self.tree.identify_column(event.x)
+            self._drag_x = event.x_root
+
+    def _col_drag_motion(self, event):
+        pass  # 拖动过程视觉反馈省略，松手生效
+
+    def _col_drag_release(self, event):
+        col = getattr(self, "_drag_col", None)
+        self._drag_col = None
+        if not col or self.tree.identify_region(event.x, event.y) != "heading":
+            return
+        if abs(event.x_root - getattr(self, "_drag_x", event.x_root)) < px(12):
+            return  # 视为普通点击，不排序
+        target = self.tree.identify_column(event.x)
+        if target and target != col:
+            self._move_column(col, target)
+
+    def _move_column(self, col, target):
+        """把 col 列移到 target 列之前/之后（按拖动方向）"""
+        disp = list(self.tree["displaycolumns"]) or list(self.tree["columns"])
+        if col not in disp or target not in disp or col == target:
+            return
+        orig_i = disp.index(col)
+        disp.remove(col)
+        tgt_i = disp.index(target)
+        disp.insert(tgt_i + 1 if orig_i < tgt_i else tgt_i, col)
+        self.tree["displaycolumns"] = disp
 
     def _typing(self):
         w = self.focus_get()
@@ -1380,6 +1415,15 @@ class LrcEditor(tk.Tk):
                 self.after(30, lambda: self._begin_cell_edit(children[row], "text"))
         self.status.set(f"已添加 {n} 个空行（输入歌词后回车确认；打轴用回车/选中行）")
 
+    def _delete_row_item(self, item):
+        ln = self.lines[self._sorted_index()[self.tree.index(item)]]
+        self._push_undo()
+        self.lines.remove(ln)
+        self.checked.discard(ln)
+        self._set_modified()
+        self.refresh()
+        self.status.set(f"已删除 1 行：{ln.text or '(空行)'}（Ctrl+Z 可撤销）")
+
     def _toggle_check(self, item):
         ln = self.lines[self._sorted_index()[self.tree.index(item)]]
         if ln in self.checked:
@@ -1399,9 +1443,9 @@ class LrcEditor(tk.Tk):
     def _on_double_click(self, event):
         col = self.tree.identify_column(event.x)
         item = self.tree.identify_row(event.y)
-        if not item or col in ("#1", "#2", "#6"):
+        if not item or col in ("#1", "#2", "#3", "#7"):
             return
-        self._begin_cell_edit(item, "time" if col == "#4" else "text")
+        self._begin_cell_edit(item, "time" if col == "#5" else "text")
 
     def _begin_cell_edit(self, item, col):
         """行内编辑：不开二级窗口，直接在单元格上覆盖输入框"""
@@ -1597,13 +1641,16 @@ class LrcEditor(tk.Tk):
         if col == "#2" and item:                # + ：在该行下方插入空行
             self.add_rows(1, after_item=item)
             return "break"
-        if col == "#6" and item:                # 行尾 ▶ 从该句播放
+        if col == "#3" and item:                # − ：删除该行（Ctrl+Z 可撤销）
+            self._delete_row_item(item)
+            return "break"
+        if col == "#7" and item:                # 行尾 ▶ 从该句播放
             self._jump_row(item)
 
     def _on_tree_motion(self, event):
         col = self.tree.identify_column(event.x)
         item = self.tree.identify_row(event.y)
-        self.tree.config(cursor="hand2" if col in ("#1", "#2", "#6") else "")
+        self.tree.config(cursor="hand2" if col in ("#1", "#2", "#3", "#7") else "")
         # 悬停在 + 上稍作停留 → 弹出批量添加菜单
         if col == "#2" and item:
             cell = (item, self.tree.set(item, "no"))
@@ -1693,14 +1740,21 @@ class LrcEditor(tk.Tk):
         if not self.audio.loaded:
             messagebox.showinfo("提示", "请先打开音频文件")
             return
-        if self.stamp_mode.get().startswith("跟随时间戳"):
+        mode = self.stamp_mode.get()
+        if mode.startswith("跟随时间戳（当前句）"):
+            self._stamp_current_line()
+        elif mode.startswith("跟随时间戳（下一句）"):
             self._stamp_next_line()
+        elif mode.startswith("手动打轴且自动平移"):
+            self._stamp_selected_line(chain=True)
         else:
             self._stamp_selected_line()
 
-    def _stamp_selected_line(self):
-        """模式一：给选中的行打当前时间戳，打完自动跳到下一行；
-        未选中时自动找第一个无时间戳行"""
+    def _stamp_selected_line(self, chain=False):
+        """模式：给选中的行打当前时间戳，打完自动跳到下一行；
+        未选中时自动找第一个无时间戳行。
+        chain=True 时（手动打轴且自动平移后面句），该行对齐后，
+        其后所有句按相同差值平移，保证后续句相对间隔不变"""
         pos = max(0, int(self.audio.get_pos()) + self.calib.get())
         children = self.tree.get_children()
         sel = self.tree.selection()
@@ -1720,14 +1774,49 @@ class LrcEditor(tk.Tk):
                 self.status.set("所有行都有时间戳了；请先选中一行再打轴")
                 return
         self._push_undo()
+        old_t = ln.first_time
         ln.times = [pos]
+        if chain and old_t is not None:
+            delta = pos - old_t
+            if delta:
+                order = [self.lines[i] for i in self._sorted_index()]
+                after = order[order.index(ln) + 1:]
+                for l2 in after:
+                    if l2.times:
+                        l2.times = [max(0, t + delta) for t in l2.times]
         self._set_modified()
         self.refresh()
         children = self.tree.get_children()
         if nxt is not None and nxt < len(children):
             self.tree.selection_set(children[nxt])
             self.tree.see(children[nxt])
-        self.status.set(f"◎ 已打轴 {ms_to_stamp(pos)} → {ln.text or '(空行)'}")
+        tip = "，后续句已同步平移" if chain else ""
+        self.status.set(f"◎ 已打轴 {ms_to_stamp(pos)} → {ln.text or '(空行)'}{tip}")
+
+    def _stamp_current_line(self):
+        """模式：给『正在唱的这句』打当前时间戳（按现有时间戳定位）"""
+        pos = max(0, int(self.audio.get_pos()) + self.calib.get())
+        order = [self.lines[i] for i in self._sorted_index()]
+        s = -1
+        for i, ln in enumerate(order):
+            if ln.times and ln.first_time <= pos:
+                s = i
+            elif ln.times:
+                break
+        target = order[s] if order and s >= 0 else (order[0] if order else None)
+        if target is None:
+            self.status.set("没有可打轴的行")
+            return
+        n = order.index(target) + 1
+        self._push_undo()
+        target.times = [pos]
+        self._set_modified()
+        self.refresh()
+        children = self.tree.get_children()
+        if n - 1 < len(children):
+            self.tree.see(children[n - 1])
+        self.status.set(
+            f"◎ 当前句已打轴 {ms_to_stamp(pos)} → 第{n}句：{target.text or '(空行)'}")
 
     def _next_line_target(self, pos):
         """『下一句』模式的目标：按播放位置找到正在唱的行，返回其下一行。
@@ -1826,12 +1915,26 @@ class LrcEditor(tk.Tk):
     def _update_stamp_target(self, pos):
         """更新『回车目标』标签与蓝色目标标记（两种模式）"""
         children = self.tree.get_children()
-        if self.stamp_mode.get().startswith("跟随时间戳"):
-            ln, n = self._next_line_target(pos)
-            item = children[n - 1] if n and n - 1 < len(children) else None
+        mode = self.stamp_mode.get()
+        if mode.startswith("跟随时间戳"):
+            if "当前句" in mode:
+                ln, n = None, None
+                best_t = -1
+                for row, li in enumerate(self._sorted_index()):
+                    t = self.lines[li].first_time
+                    if t is not None and t <= pos and t >= best_t:
+                        ln, n, best_t = self.lines[li], row + 1, t
+                item = children[n - 1] if n and n - 1 < len(children) else None
+            else:
+                ln, n = self._next_line_target(pos)
+                item = children[n - 1] if n and n - 1 < len(children) else None
             self._mark_aim(item)
-            self.stamp_target_lbl.config(
-                text=f"◎ 将打轴：第{n}句 {ln.text or '(空行)'}" if ln else "◎ 没有下一句了")
+            if ln:
+                self.stamp_target_lbl.config(
+                    text=f"◎ 将打轴：{'当前句' if '当前句' in mode else '下一句'}"
+                         f"第{n}句 {ln.text or '(空行)'}")
+            else:
+                self.stamp_target_lbl.config(text="◎ 没有可打轴的句子")
         else:
             self._mark_aim(None)
             sel = self.tree.selection()
@@ -1846,7 +1949,7 @@ class LrcEditor(tk.Tk):
                 self.stamp_target_lbl.config(text="◎ 未选中行")
 
     def _tick(self):
-        """100ms 轮询：刷新播放时间、进度条、当前句高亮、按钮文案"""
+        """60ms 轮询：刷新播放时间、进度条、当前句高亮、按钮文案"""
         try:
             alive = self.winfo_exists()
         except tk.TclError:
@@ -1869,7 +1972,7 @@ class LrcEditor(tk.Tk):
                 self.btn_play.config(text="⏸ 暂停" if a.playing else "▶ 播放")
                 if a.playing:
                     self.time_lbl.config(foreground="")
-                    if self.stamp_mode.get().startswith("跟随时间戳"):
+                    if self.stamp_mode.get().startswith("跟随时间戳"):  # 手动两种模式不按旧时间戳换行
                         item = self._find_singing_item(pos)
                         self._mark_singing(item)
                         self.tree.tag_configure(
@@ -1897,7 +2000,7 @@ class LrcEditor(tk.Tk):
                 else:
                     self.time_lbl.config(foreground="")
         try:
-            self.after(100, self._tick)
+            self.after(60, self._tick)
         except tk.TclError:  # 窗口已销毁
             pass
 
