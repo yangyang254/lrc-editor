@@ -1,0 +1,15 @@
+# 构建产物
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 用户本地设置
+lrc_editor_settings.json
+
+# 临时/测试产物
+window_rect.txt
+*.png.bak
