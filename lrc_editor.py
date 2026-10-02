@@ -927,7 +927,8 @@ class LrcEditor(tk.Tk):
         self.tree.bind("<Leave>", lambda e: setattr(self, "_hover_cell", None))
         self.tree.bind("<F2>", lambda e: self._begin_cell_edit_sel("text"))
         self.tree.bind("<<TreeviewSelect>>", self._on_select_change)
-        self.tree.bind("<Motion>", self._drag_motion, add="+")
+        # 注意：按住拖动产生的是 B1-Motion，普通 <Motion> 此时不会触发
+        self.tree.bind("<B1-Motion>", self._drag_motion, add="+")
         self.tree.bind("<ButtonRelease-1>", self._tree_release, add="+")
         # 列头按住拖动可调换列顺序
         self.tree.bind("<ButtonPress-1>", self._col_drag_press, add="+")
