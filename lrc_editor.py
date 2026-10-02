@@ -442,12 +442,13 @@ class LrcEditor(tk.Tk):
         self._redo_stack = []
         self._manual_scroll = 0.0  # 最近一次手动滚动歌词列表的时间
         self._aim_item = None      # 回车打轴目标的行（下一句模式的可视化标记）
-        self.checked = set()       # 行首复选框勾选的行（批量删除等）
+        # 批量选择统一用树控件的多选：行首 ☑ 只是选中状态的可视化
+        self._drag_sel = None      # 按住拖动批量选择状态
         self._editor = None        # 行内编辑器 (entry, item, col, ln)
         self._hover_cell = None    # 悬停的 + 单元格
         self._hover_job = None
         self.clip_lines = []       # 内部歌词剪贴板（结构化行）
-        self._hold_select = None   # 长按拖动批量选择状态
+        self._drag_sel = None      # 按住拖动批量选择状态
 
         self._setup_style()
         self._build_menu()
@@ -887,6 +888,7 @@ class LrcEditor(tk.Tk):
         self.pl_list.bind("<Double-1>", lambda e: self.switch_track(self.pl_list.nearest(e.y)))
 
         mid = ttk.LabelFrame(midwrap, text="歌词行（双击编辑 ｜ Ctrl/Shift 多选批量操作 ｜ 右键菜单：从某句开始播放）")
+        self.mid = mid
         mid.pack(side="left", fill="both", expand=True)
         cols = ("chk", "add", "del", "no", "time", "text", "play")
         self.tree = ttk.Treeview(mid, columns=cols, show="headings", selectmode="extended")
@@ -924,7 +926,8 @@ class LrcEditor(tk.Tk):
         self.tree.bind("<Motion>", self._on_tree_motion)
         self.tree.bind("<Leave>", lambda e: setattr(self, "_hover_cell", None))
         self.tree.bind("<F2>", lambda e: self._begin_cell_edit_sel("text"))
-        self.tree.bind("<Motion>", self._hold_motion, add="+")
+        self.tree.bind("<<TreeviewSelect>>", self._on_select_change)
+        self.tree.bind("<Motion>", self._drag_motion, add="+")
         self.tree.bind("<ButtonRelease-1>", self._tree_release, add="+")
         # 列头按住拖动可调换列顺序
         self.tree.bind("<ButtonPress-1>", self._col_drag_press, add="+")
@@ -1064,29 +1067,15 @@ class LrcEditor(tk.Tk):
         disp.insert(tgt_i + 1 if orig_i < tgt_i else tgt_i, col)
         self.tree["displaycolumns"] = disp
 
-    def _start_hold_select(self, item):
-        hs = getattr(self, "_hold_select", None)
-        if not hs or hs.get("item") != item:
-            return
-        hs["active"] = True
-        self._select_range(item, item)
-
-    def _hold_motion(self, event):
-        hs = self._hold_select
-        if hs and hs.get("active"):
+    def _drag_motion(self, event):
+        ds = self._drag_sel
+        if ds:
             item = self.tree.identify_row(event.y)
             if item:
-                self._select_range(hs["item"], item)
+                self._select_range(ds["item"], item)
 
     def _tree_release(self, event):
-        hs = getattr(self, "_hold_select", None)
-        if hs:
-            if hs.get("after"):
-                try:
-                    self.after_cancel(hs["after"])
-                except Exception:
-                    pass
-            self._hold_select = None
+        self._drag_sel = None
 
     def _select_range(self, a, b):
         children = self.tree.get_children()
@@ -1136,7 +1125,7 @@ class LrcEditor(tk.Tk):
             self._push_undo()
             for l in targets:
                 self.lines.remove(l)
-            self.checked = {l for l in self.checked if l not in targets}
+            pass
             self._set_modified()
             self.refresh()
             self.status.set(f"✂ 已剪切 {len(targets)} 行 — Ctrl+V 粘贴（时间戳留空待打轴）")
@@ -1181,6 +1170,20 @@ class LrcEditor(tk.Tk):
                 self.tree.see(children[row])
         self.status.set(
             f"⇩ 已粘贴 {len(new)} 行到选中行下方（时间戳留空，等待手动打轴；Ctrl+Z 可撤销）")
+
+    def _sync_checkmarks(self):
+        """行首 ☑ 跟随树的多选状态"""
+        sel = set(self.tree.selection())
+        for item in self.tree.get_children():
+            want = "☑" if item in sel else "☐"
+            if self.tree.set(item, "chk") != want:
+                self.tree.set(item, "chk", want)
+
+    def _on_select_change(self, _event=None):
+        """选中变化：同步行首 ☑ 标记，并刷新打轴目标提示"""
+        self._sync_checkmarks()
+        self._update_stamp_target(
+            self.audio.get_pos() if self.audio.loaded else None)
 
     def _typing(self):
         w = self.focus_get()
@@ -1319,7 +1322,7 @@ class LrcEditor(tk.Tk):
             messagebox.showinfo("提示", "该文件夹中没有音频文件\n（支持 mp3/wav/ogg/flac/m4a/aac）")
             return
         self.playlist = files
-        self.pl_frame.pack(side="right", fill="y", padx=(px(6), px(0)))
+        self.pl_frame.pack(side="right", fill="y", padx=(px(6), px(0)), before=self.mid)
         self._sync_playlist_selection()
         self.switch_track(0, force=True)
 
@@ -1462,7 +1465,7 @@ class LrcEditor(tk.Tk):
         self._pv_job = None
         self._singing_item = None
         self._aim_item = None
-        self.checked = {l for l in self.checked if l in self.lines}
+        keep_sel = [l for l in self._selected_lines() if l in self.lines]
         self.tree.delete(*self.tree.get_children())
         self._row_tags.clear()
         sorted_lines = self._display_order()
@@ -1482,11 +1485,20 @@ class LrcEditor(tk.Tk):
             if not ln.text.strip():
                 tags.append("warn")
             item = self.tree.insert("", "end",
-                                    values=("☑" if ln in self.checked else "☐", "+", "−",
+                                    values=("☑" if ln in keep_sel else "☐", "+", "−",
                                             i, stamp, ln.text, "▶" if ln.times else ""),
                                     tags=tuple(tags))
             self._row_tags[item] = tuple(tags)
         self.count_lbl.config(text=f"{len(self.lines)} 行")
+        # 重建列表后恢复之前选中的行（复选框 ☑ 跟随选中状态）
+        if keep_sel:
+            disp = self._display_order()
+            rows = [disp.index(l) for l in keep_sel if l in disp]
+            children = self.tree.get_children()
+            good = [children[r] for r in rows if r < len(children)]
+            if good:
+                self.tree.selection_set(good)
+                self.tree.see(good[0])
         # 无歌词占位提示的显隐
         if self.lines or self.meta:
             self.empty_state.place_forget()
@@ -1512,9 +1524,12 @@ class LrcEditor(tk.Tk):
 
     def _selected_lines(self):
         sel = set(self.tree.selection())
-        children = self.tree.get_children()
-        return [self.lines[self._sorted_index()[children.index(item)]]
-                for item in children if item in sel]  # 按显示顺序返回
+        sidx = self._sorted_index()
+        out = []
+        for row, item in enumerate(self.tree.get_children()):
+            if item in sel and row < len(sidx):  # 行可能刚被删，树还没重建
+                out.append(self.lines[sidx[row]])
+        return out  # 按显示顺序返回
 
     # ---------- 行编辑 ----------
 
@@ -1556,19 +1571,17 @@ class LrcEditor(tk.Tk):
         ln = self.lines[self._sorted_index()[self.tree.index(item)]]
         self._push_undo()
         self.lines.remove(ln)
-        self.checked.discard(ln)
         self._set_modified()
         self.refresh()
         self.status.set(f"已删除 1 行：{ln.text or '(空行)'}（Ctrl+Z 可撤销）")
 
     def _toggle_check(self, item):
-        ln = self.lines[self._sorted_index()[self.tree.index(item)]]
-        if ln in self.checked:
-            self.checked.discard(ln)
-            self.tree.set(item, "chk", "☐")
+        """复选框即多选：勾选 = 加入选中（可配合批量操作），取消 = 移出选中"""
+        if item in self.tree.selection():
+            self.tree.selection_remove(item)
         else:
-            self.checked.add(ln)
-            self.tree.set(item, "chk", "☑")
+            self.tree.selection_add(item)
+        self._sync_checkmarks()
 
     def _begin_cell_edit_sel(self, col):
         sel = self.tree.selection()
@@ -1647,16 +1660,12 @@ class LrcEditor(tk.Tk):
         self.status.set("✎ 已修改（Ctrl+Z 可撤销）")
 
     def delete_lines(self):
-        if self.checked:
-            targets = [l for l in self.lines if l in self.checked]
-        else:
-            targets = self._selected_lines()
+        targets = self._selected_lines()
         if not targets:
             return
         self._push_undo()
         for ln in targets:
             self.lines.remove(ln)
-        self.checked.clear()
         self._set_modified()
         self.refresh()
         self.status.set(f"已删除 {len(targets)} 行")
@@ -1783,12 +1792,12 @@ class LrcEditor(tk.Tk):
             return "break"
         if col == "#7" and item:                # 行尾 ▶ 从该句播放
             self._jump_row(item)
-        if (col in ("#4", "#5") and item
+        if (col in ("#4", "#5", "#3", "#6") and item
                 and not (event.state & 0x0004) and not (event.state & 0x0001)):
-            # 按住句子 0.5 秒后进入拖动批量选择（上下拖快速多选）
-            self._hold_select = {"item": item, "active": False,
-                                 "after": self.after(
-                                     500, lambda: self._start_hold_select(item))}
+            # 按住句子直接上下拖动 = 连续多选（松手完成）
+            self._drag_sel = {"item": item}
+            self.tree.selection_set(item)
+            return "break"
 
     def _on_tree_motion(self, event):
         col = self.tree.identify_column(event.x)
