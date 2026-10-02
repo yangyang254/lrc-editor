@@ -1876,8 +1876,9 @@ class LrcEditor(tk.Tk):
             self.status.set(f"▶ 从 {ms_to_stamp(ln.first_time)} 开始：{ln.text or '(空行)'}")
 
     def set_as_first(self):
-        """把选中句的时间戳设为当前播放位置，其后所有句按差值同步平移。
-        用途：暂停在第一句开口处，右键第一句 → 整首歌词对齐。"""
+        """把选中句的时间戳设为当前播放位置，列表中它下方的所有行按差值同步平移。
+        按列表位置（而非时间值）判定范围：所见即所改，时间乱序也不会算错对象。
+        负差值平移到 0 为止。"""
         if not self.audio.loaded:
             messagebox.showinfo("提示", "请先打开音频文件")
             return
@@ -1885,22 +1886,23 @@ class LrcEditor(tk.Tk):
         if not sel:
             self.status.set("请先选中一句歌词（暂停后右键目标句）")
             return
-        anchor = self.lines[self._sorted_index()[self.tree.index(sel[0])]]
+        anchor_row = self._sorted_index()[self.tree.index(sel[0])]
+        anchor = self.lines[anchor_row]
         if not anchor.times:
             self.status.set("该行没有时间戳，无法作为基准；请先用回车给它打轴")
             return
         self._push_undo()
         t = max(0, int(self.audio.get_pos()) + self.calib.get())
-        anchor_orig = anchor.first_time  # 必须先存常量：锚点平移后 first_time 会变
-        delta = t - anchor_orig
-        for ln in self.lines:
-            if ln.first_time is not None and ln.first_time >= anchor_orig:
+        delta = t - anchor.first_time
+        for i in range(anchor_row, len(self.lines)):
+            ln = self.lines[i]
+            if ln.times:
                 ln.times = [max(0, x + delta) for x in ln.times]
         self._set_modified()
         self.refresh()
         self.status.set(
-            f"⏱ 已将 {fmt_clock(t)} 设为该句开头，后续句平移 {delta / 1000:+g}s"
-            f"（Ctrl+Z 可撤销）")
+            f"⏱ 已将 {fmt_clock(t)} 设为该句开头，其后 {len(self.lines) - anchor_row} 行平移 "
+            f"{delta / 1000:+g}s（Ctrl+Z 可撤销）")
 
     def _show_ctx(self, event):
         if self._editor:
