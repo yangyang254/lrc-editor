@@ -441,6 +441,7 @@ class LrcEditor(tk.Tk):
         self._undo_stack = []    # 快照栈（撤销/重做）
         self._redo_stack = []
         self._manual_scroll = 0.0  # 最近一次手动滚动歌词列表的时间
+        self._aim_item = None      # 回车打轴目标的行（下一句模式的可视化标记）
 
         self._setup_style()
         self._build_menu()
@@ -676,6 +677,7 @@ class LrcEditor(tk.Tk):
         self.tree.tag_configure("warn", background=PAL["warn"])
         self.tree.tag_configure("bad", background=PAL["bad"])
         self.tree.tag_configure("singing", foreground=PAL["accent"])
+        self.tree.tag_configure("aim", foreground=PAL["link"])
         for m in self._menus:
             self._apply_menu_theme(m)
 
@@ -707,6 +709,15 @@ class LrcEditor(tk.Tk):
         m_time.add_command(label="平移时间戳…（整体/选中行）", command=self.shift_times)
         m_time.add_command(label="按时间排序", command=self.sort_lines)
         m_time.add_command(label="时间戳格式标准化", command=self.normalize_stamps)
+        m_time.add_separator()
+        m_time.add_command(label="微调选中句 -100ms（Alt+←）",
+                           command=lambda: self.nudge_selected(-100))
+        m_time.add_command(label="微调选中句 +100ms（Alt+→）",
+                           command=lambda: self.nudge_selected(100))
+        m_time.add_command(label="微调选中句 -10ms（Shift+Alt+←）",
+                           command=lambda: self.nudge_selected(-10))
+        m_time.add_command(label="微调选中句 +10ms（Shift+Alt+→）",
+                           command=lambda: self.nudge_selected(10))
         mb.add_cascade(label="时间戳", menu=m_time)
 
         m_play = tk.Menu(mb, tearoff=0)
@@ -778,7 +789,7 @@ class LrcEditor(tk.Tk):
 
         # 音频 / 打轴栏
         audio = ttk.LabelFrame(
-            self, text="音乐播放打轴　—　空格 播放/暂停 ｜ 回车 给选中行打当前时间戳并跳到下一行")
+            self, text="音乐播放打轴　—　空格 播放/暂停 ｜ 回车 打轴（目标见『回车目标』） ｜ Alt+←/→ 微调选中句")
         audio.pack(fill="x", padx=px(10), pady=px(4))
 
         row1 = ttk.Frame(audio)
@@ -818,7 +829,14 @@ class LrcEditor(tk.Tk):
         ttk.Checkbutton(row2, text="跟随当前句", variable=self.follow).pack(side="left")
         self.btn_stamp = ttk.Button(row2, text="◎ 打轴 (回车)", style="Accent.TButton",
                                     command=self.stamp_selected)
-        self.btn_stamp.pack(side="left", padx=(px(10), px(0)))
+        self.btn_stamp.pack(side="left", padx=(10, 0))
+        ttk.Label(row2, text="回车目标").pack(side="left", padx=(10, 2))
+        self.stamp_mode = tk.StringVar(value="选中行")
+        ttk.Combobox(row2, textvariable=self.stamp_mode, width=15, state="readonly",
+                     values=["选中行", "正在唱的下一句"]).pack(side="left")
+        self.stamp_mode.trace_add("write", lambda *a: self._tick())
+        self.stamp_target_lbl = ttk.Label(row2, text="", foreground=PAL["link"])
+        self.stamp_target_lbl.pack(side="left", padx=(10, 0))
 
         row3 = ttk.Frame(audio)
         row3.pack(fill="x", padx=px(10), pady=(px(0), px(6)))
@@ -893,6 +911,8 @@ class LrcEditor(tk.Tk):
         self.tree.tag_configure("warn", background=PAL["warn"])
         self.tree.tag_configure("bad", background=PAL["bad"])
         self.tree.tag_configure("singing", foreground=PAL["accent"],
+                                font=(self.font_base[0], 10, "bold"))
+        self.tree.tag_configure("aim", foreground=PAL["link"],
                                 font=(self.font_base[0], 10, "bold"))
 
         # 右键菜单
@@ -969,6 +989,10 @@ class LrcEditor(tk.Tk):
         self.bind("<Control-j>", lambda e: self.jump_to_selected())
         self.bind("<Control-Left>", lambda e: None if self._typing() else self._audio_seek(-2000))
         self.bind("<Control-Right>", lambda e: None if self._typing() else self._audio_seek(2000))
+        self.bind("<Alt-Left>", lambda e: None if self._typing() else self.nudge_selected(-100))
+        self.bind("<Alt-Right>", lambda e: None if self._typing() else self.nudge_selected(100))
+        self.bind("<Alt-Shift-Left>", lambda e: None if self._typing() else self.nudge_selected(-10))
+        self.bind("<Alt-Shift-Right>", lambda e: None if self._typing() else self.nudge_selected(10))
         self.bind("<F9>", lambda e: self.smart_fix())
         self.bind("<Delete>", lambda e: self.delete_lines())
         self.bind("<Control-z>", self.undo)
@@ -1249,6 +1273,7 @@ class LrcEditor(tk.Tk):
     def refresh(self):
         self._pv_job = None
         self._singing_item = None
+        self._aim_item = None
         self.tree.delete(*self.tree.get_children())
         self._row_tags.clear()
         sorted_lines = sorted(self.lines, key=lambda l: l.first_time if l.times else 10**9)
@@ -1524,9 +1549,18 @@ class LrcEditor(tk.Tk):
         self.ctx.tk_popup(event.x_root, event.y_root)
 
     def stamp_selected(self):
+        """回车打轴入口：按『回车目标』模式分发"""
         if not self.audio.loaded:
             messagebox.showinfo("提示", "请先打开音频文件")
             return
+        if self.stamp_mode.get() == "正在唱的下一句":
+            self._stamp_next_line()
+        else:
+            self._stamp_selected_line()
+
+    def _stamp_selected_line(self):
+        """模式一：给选中的行打当前时间戳，打完自动跳到下一行；
+        未选中时自动找第一个无时间戳行"""
         pos = max(0, int(self.audio.get_pos()) + self.calib.get())
         children = self.tree.get_children()
         sel = self.tree.selection()
@@ -1555,17 +1589,121 @@ class LrcEditor(tk.Tk):
             self.tree.see(children[nxt])
         self.status.set(f"◎ 已打轴 {ms_to_stamp(pos)} → {ln.text or '(空行)'}")
 
+    def _next_line_target(self, pos):
+        """『下一句』模式的目标：按播放位置找到正在唱的行，返回其下一行。
+        返回 (行对象, 显示行号从1)；pos 在所有行之前 → 第一行；之后 → None"""
+        order = [self.lines[i] for i in self._sorted_index()]
+        s = -1
+        for i, ln in enumerate(order):
+            if ln.times and ln.first_time <= pos:
+                s = i
+            elif ln.times:
+                break
+        if s + 1 < len(order):
+            return order[s + 1], s + 2
+        return None, None
+
+    def _stamp_next_line(self):
+        """模式二：不管选中谁，给『正在唱的下一句』打轴。
+        适合修正已有时间戳：听到歌词切换的瞬间按回车，该句重新对齐，绝不会落到上一句"""
+        pos = max(0, int(self.audio.get_pos()) + self.calib.get())
+        order = [self.lines[i] for i in self._sorted_index()]
+        ln, n = self._next_line_target(pos)
+        if ln is None:
+            self.status.set("已经过了最后一句，没有可打轴的行了")
+            return
+        self._push_undo()
+        ln.times = [pos]
+        self._set_modified()
+        self.refresh()
+        children = self.tree.get_children()
+        if 0 < n <= len(children):
+            self.tree.see(children[n - 1])
+        self.status.set(
+            f"◎ 下一句已打轴 {ms_to_stamp(pos)} → 第{n}句：{ln.text or '(空行)'}"
+            f"（继续听，下次回车自动是再下一句）")
+
+    def nudge_selected(self, delta_ms):
+        """微调选中句 ±100ms / ±10ms；播放中自动跳到新起点试听"""
+        sel = self.tree.selection()
+        if not sel:
+            self.status.set("请先选中要微调的行")
+            return
+        ln = self.lines[self._sorted_index()[self.tree.index(sel[0])]]
+        if not ln.times:
+            self.status.set("该行没有时间戳，无法微调")
+            return
+        self._push_undo()
+        ln.times = [max(0, t + delta_ms) for t in ln.times]
+        self._set_modified()
+        self.refresh()
+        self._reselect_line(ln)
+        msg = f"微调 {delta_ms / 1000:+g}s → {ms_to_stamp(ln.first_time)} {ln.text or ''}"
+        if self.audio.playing:
+            self.audio.seek(ln.first_time)
+            msg += "（已跳转试听）"
+        self.status.set(msg + "（Ctrl+Z 可撤销）")
+
+    def _reselect_line(self, ln):
+        """refresh 重建列表后，重新选中同一行（按行对象定位，顺序变了也能找到）"""
+        for row, li in enumerate(self._sorted_index()):
+            if self.lines[li] is ln:
+                children = self.tree.get_children()
+                if row < len(children):
+                    self.tree.selection_set(children[row])
+                    self.tree.see(children[row])
+                return
+
+    def _apply_row_tags(self, item):
+        """按当前 singing/aim 状态重算某行的显示 tags"""
+        if not (item and self.tree.exists(item) and item in self._row_tags):
+            return
+        tags = list(self._row_tags[item])
+        if item == self._singing_item:
+            tags.append("singing")
+        if item == self._aim_item:
+            tags.append("aim")
+        self.tree.item(item, tags=tuple(tags))
+
     def _mark_singing(self, item):
-        """切换高亮到 item（None 清除）"""
+        """当前句高亮切换到 item（None 清除）"""
         old = self._singing_item
         if old == item:
             return
-        if old and self.tree.exists(old) and old in self._row_tags:
-            self.tree.item(old, tags=self._row_tags[old])
-        self._singing_item = None
-        if item and self.tree.exists(item) and item in self._row_tags:
-            self.tree.item(item, tags=self._row_tags[item] + ("singing",))
-            self._singing_item = item
+        self._singing_item = item
+        self._apply_row_tags(old)
+        self._apply_row_tags(item)
+
+    def _mark_aim(self, item):
+        """回车打轴目标标记切换到 item（None 清除）"""
+        old = self._aim_item
+        if old == item:
+            return
+        self._aim_item = item
+        self._apply_row_tags(old)
+        self._apply_row_tags(item)
+
+    def _update_stamp_target(self, pos):
+        """更新『回车目标』标签与蓝色目标标记（两种模式）"""
+        children = self.tree.get_children()
+        if self.stamp_mode.get() == "正在唱的下一句":
+            ln, n = self._next_line_target(pos)
+            item = children[n - 1] if n and n - 1 < len(children) else None
+            self._mark_aim(item)
+            self.stamp_target_lbl.config(
+                text=f"◎ 将打轴：第{n}句 {ln.text or '(空行)'}" if ln else "◎ 没有下一句了")
+        else:
+            self._mark_aim(None)
+            sel = self.tree.selection()
+            if sel:
+                row = self.tree.index(sel[0])
+                ln = self.lines[self._sorted_index()[row]]
+                self.stamp_target_lbl.config(
+                    text=f"◎ 将打轴：选中第{row + 1}句 {ln.text or '(空行)'}")
+            elif any(not l.times for l in self.lines):
+                self.stamp_target_lbl.config(text="◎ 未选中：将自动打第一个无时间戳行")
+            else:
+                self.stamp_target_lbl.config(text="◎ 未选中行")
 
     def _tick(self):
         """100ms 轮询：刷新播放时间、进度条、当前句高亮、按钮文案"""
@@ -1579,6 +1717,10 @@ class LrcEditor(tk.Tk):
         if a.loaded:
             self._refresh_time_display()
             pos = a.get_pos()
+            try:
+                self._update_stamp_target(pos)
+            except tk.TclError:
+                pass
             if a.ended():
                 a.stop()
                 self.btn_play.config(text="▶ 播放")
